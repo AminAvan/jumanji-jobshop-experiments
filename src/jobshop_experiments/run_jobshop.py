@@ -39,15 +39,15 @@ class PPOConfig:
 
     # Training config
     num_epochs: int = 65
-    num_learner_steps_per_epoch: int = 200
+    num_learner_steps_per_epoch: int = 50  # Down from 200
     n_steps: int = 10
     total_batch_size: int = 128
     num_minibatches: int = 4
     update_epochs: int = 4
 
     # Evaluation config
-    eval_episodes: int = 32
-    eval_frequency: int = 5
+    eval_episodes: int = 16  # Down from 32
+    eval_frequency: int = 10  # Evaluate every 10 epochs instead of 5
 
     # PPO hyperparameters
     learning_rate: float = 1e-4
