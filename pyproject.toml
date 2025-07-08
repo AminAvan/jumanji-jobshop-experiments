@@ -31,7 +31,6 @@ dev = [
     "isort",
     "flake8",
     "mypy",
-    "pre-commit",
     "jupyter",
     "ipython",
 ]
