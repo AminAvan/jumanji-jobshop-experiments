@@ -3,400 +3,641 @@ import jax.numpy as jnp
 import jumanji
 from jumanji.environments.packing.job_shop import JobShop
 from jumanji.environments.packing.job_shop.generator import RandomGenerator, ToyGenerator
-from typing import List, Dict, Any, Optional, Tuple
+from jumanji.training.networks.job_shop import make_actor_critic_networks_job_shop
+from jumanji.training.networks.actor_critic import ActorCriticNetworks
+import haiku as hk
+from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import yaml
 import os
 import json
 import numpy as np
+from dataclasses import dataclass
+import optax
+from functools import partial
+import chex
 
 
-class JobShopRunner:
-    def __init__(self, config_path: Optional[str] = None):
-        """Initialize JobShop environment with specific parameters."""
-        # Load configuration
-        if config_path and os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
-        else:
-            self.config = {
-                'environment': {
-                    'name': 'JobShop-v0',
-                    'num_jobs': 5,
-                    'num_machines': 4,
-                    'max_num_ops': 4,
-                    'max_op_duration': 4
-                }
-            }
+@dataclass
+class PPOConfig:
+    """Configuration for PPO training matching the multi-agent scenario."""
+    # Environment config
+    num_jobs: int = 5
+    num_machines: int = 4
+    max_num_ops: int = 4
+    max_op_duration: int = 4
 
-        # Create JobShop environment with custom generator
-        env_config = self.config['environment']
+    # Network architecture (matching multi-agent config)
+    num_layers_machines: int = 1
+    num_layers_operations: int = 1
+    num_layers_joint_machines_jobs: int = 2
+    transformer_num_heads: int = 8
+    transformer_key_size: int = 16
+    transformer_mlp_units: List[int] = None
 
-        # Create a RandomGenerator with your specific parameters
+    # Training config
+    num_epochs: int = 65
+    num_learner_steps_per_epoch: int = 200
+    n_steps: int = 10
+    total_batch_size: int = 128
+    num_minibatches: int = 4
+    update_epochs: int = 4
+
+    # Evaluation config
+    eval_episodes: int = 32
+    eval_frequency: int = 5
+
+    # PPO hyperparameters
+    learning_rate: float = 1e-4
+    discount_factor: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
+    value_loss_coef: float = 1.0
+    entropy_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    normalize_advantage: bool = True
+
+    def __post_init__(self):
+        if self.transformer_mlp_units is None:
+            self.transformer_mlp_units = [512]
+
+
+class PPOTrajectory(NamedTuple):
+    """Store trajectory data for PPO training."""
+    observations: Any  # JobShop observations
+    actions: jnp.ndarray
+    rewards: jnp.ndarray
+    dones: jnp.ndarray
+    values: jnp.ndarray
+    log_probs: jnp.ndarray
+    advantages: jnp.ndarray
+    returns: jnp.ndarray
+
+
+class PPOJobShopRL:
+    """PPO implementation using Jumanji's official JobShop networks."""
+
+    def __init__(self, config: PPOConfig):
+        self.config = config
+
+        # Create environment
         generator = RandomGenerator(
-            num_jobs=env_config['num_jobs'],
-            num_machines=env_config['num_machines'],
-            max_num_ops=env_config['max_num_ops'],
-            max_op_duration=env_config['max_op_duration']
+            num_jobs=config.num_jobs,
+            num_machines=config.num_machines,
+            max_num_ops=config.max_num_ops,
+            max_op_duration=config.max_op_duration
         )
-
-        # Create the JobShop environment with the custom generator
         self.env = JobShop(generator=generator)
 
-        print(f"Created JobShop environment with custom parameters:")
-        print(f"  - num_jobs: {self.env.num_jobs}")
-        print(f"  - num_machines: {self.env.num_machines}")
-        print(f"  - max_num_ops: {self.env.max_num_ops}")
-        print(f"  - max_op_duration: {self.env.max_op_duration}")
+        # Create official Jumanji networks
+        self.networks = make_actor_critic_networks_job_shop(
+            job_shop=self.env,
+            num_layers_machines=config.num_layers_machines,
+            num_layers_operations=config.num_layers_operations,
+            num_layers_joint_machines_jobs=config.num_layers_joint_machines_jobs,
+            transformer_num_heads=config.transformer_num_heads,
+            transformer_key_size=config.transformer_key_size,
+            transformer_mlp_units=config.transformer_mlp_units,
+        )
 
-        # Print environment specifications
-        self._print_env_specs()
+        # Initialize optimizer
+        self.optimizer = optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adam(config.learning_rate, eps=1e-5)
+        )
 
-    def _print_env_specs(self):
-        """Print environment specifications."""
-        print("\nEnvironment Specifications:")
-        print(f"  - Observation spec: {self.env.observation_spec}")
-        print(f"\n  - Action spec: {self.env.action_spec}")
+        print(f"PPO with Official JobShop Networks:")
+        print(f"  - Environment: {config.num_jobs} jobs, {config.num_machines} machines")
+        print(f"  - Network: Transformer-based with {config.transformer_num_heads} heads")
+        print(f"  - Training epochs: {config.num_epochs}")
+        print(f"  - PPO clip epsilon: {config.clip_epsilon}")
 
-    def _select_valid_action(self, key: jax.random.PRNGKey, action_mask: jnp.ndarray) -> jnp.ndarray:
-        """Select a valid action based on the action mask.
+    def init_params(self, key: chex.PRNGKey):
+        """Initialize network parameters."""
+        key1, key2 = jax.random.split(key)
 
-        The action is an array of shape (num_machines,) where each element is the job ID
-        to be scheduled on that machine (or num_jobs for no-op).
-        """
-        num_machines = action_mask.shape[0]
-        actions = []
+        # Get a dummy observation to initialize networks
+        dummy_state, dummy_timestep = self.env.reset(key1)
+        dummy_obs = dummy_timestep.observation
 
-        for machine_idx in range(num_machines):
-            machine_mask = action_mask[machine_idx]
-            valid_job_ids = jnp.where(machine_mask)[0]
+        # Initialize both actor and critic networks
+        policy_params = self.networks.policy_network.init(key2, dummy_obs)
+        value_params = self.networks.value_network.init(key2, dummy_obs)
 
-            if len(valid_job_ids) > 0:
-                # Select a random valid job for this machine
-                key, subkey = jax.random.split(key)
-                action = jax.random.choice(subkey, valid_job_ids)
+        return {'policy': policy_params, 'value': value_params}
+
+    @partial(jax.jit, static_argnums=(0,))
+    def act(self, params, obs, key):
+        """Select action using the policy network."""
+        # Get action logits from policy network
+        logits = self.networks.policy_network.apply(params['policy'], obs)
+
+        # Sample action from the distribution
+        action_dist = self.networks.parametric_action_distribution.create_dist(logits)
+        action = action_dist.sample(seed=key)
+        log_prob = action_dist.log_prob(action)
+
+        # Get value from critic network
+        value = self.networks.value_network.apply(params['value'], obs)
+
+        # Compute entropy for regularization
+        entropy = action_dist.entropy()
+
+        return action, log_prob, value, entropy
+
+    @partial(jax.jit, static_argnums=(0,))
+    def evaluate_actions(self, params, obs, actions):
+        """Evaluate actions for PPO loss computation."""
+        # Get action logits and values
+        logits = self.networks.policy_network.apply(params['policy'], obs)
+        values = self.networks.value_network.apply(params['value'], obs)
+
+        # Create distribution and compute log probs
+        action_dist = self.networks.parametric_action_distribution.create_dist(logits)
+        log_probs = action_dist.log_prob(actions)
+        entropy = action_dist.entropy()
+
+        return log_probs, values, entropy
+
+    def compute_gae(self, rewards, values, dones):
+        """Compute Generalized Advantage Estimation."""
+        T = len(rewards)
+        advantages = jnp.zeros(T)
+        lastgaelam = 0
+
+        for t in reversed(range(T)):
+            if t == T - 1:
+                nextnonterminal = 1.0 - dones[-1]
+                nextvalues = 0
             else:
-                # No valid jobs for this machine, select no-op
-                action = self.env.no_op_idx
-            actions.append(action)
+                nextnonterminal = 1.0 - dones[t]
+                nextvalues = values[t + 1]
 
-        return jnp.array(actions, dtype=jnp.int32)
+            delta = rewards[t] + self.config.discount_factor * nextvalues * nextnonterminal - values[t]
+            advantages = advantages.at[t].set(
+                delta + self.config.discount_factor * self.config.gae_lambda * nextnonterminal * lastgaelam
+            )
+            lastgaelam = advantages[t]
 
-    def run_scenario(self, scenario_seed: int = 0, render: bool = False, max_steps: int = 1000) -> Dict[str, Any]:
-        """Run a single scenario."""
-        key = jax.random.PRNGKey(scenario_seed)
-        state, timestep = self.env.reset(key)
+        returns = advantages + values
+        return advantages, returns
 
-        # Store scenario information
-        scenario_info = {
-            'seed': scenario_seed,
-            'config': self.config['environment'],
-            'steps': [],
-            'total_reward': 0,
-            'episode_length': 0,
-            'makespan': None
+    def collect_trajectories(self, params, key, num_envs):
+        """Collect trajectories using current policy."""
+        # Initialize environments
+        keys = jax.random.split(key, num_envs + 1)
+        key = keys[0]
+
+        # Reset all environments
+        reset_keys = keys[1:]
+        states = []
+        timesteps = []
+
+        for i in range(num_envs):
+            state, timestep = self.env.reset(reset_keys[i])
+            states.append(state)
+            timesteps.append(timestep)
+
+        # Storage
+        all_observations = []
+        all_actions = []
+        all_rewards = []
+        all_dones = []
+        all_values = []
+        all_log_probs = []
+
+        # Collect n_steps of experience
+        for step in range(self.config.n_steps):
+            # Store observations
+            observations = [ts.observation for ts in timesteps]
+            all_observations.append(observations)
+
+            # Get actions for all environments
+            actions = []
+            log_probs = []
+            values = []
+            entropies = []
+
+            keys = jax.random.split(key, num_envs + 1)
+            key = keys[0]
+
+            for i in range(num_envs):
+                action, log_prob, value, entropy = self.act(
+                    params, timesteps[i].observation, keys[i + 1]
+                )
+                actions.append(action)
+                log_probs.append(log_prob)
+                values.append(value)
+                entropies.append(entropy)
+
+            all_actions.append(actions)
+            all_log_probs.append(log_probs)
+            all_values.append(values)
+
+            # Step environments
+            rewards = []
+            dones = []
+
+            for i in range(num_envs):
+                state, timestep = self.env.step(states[i], actions[i])
+                states[i] = state
+                timesteps[i] = timestep
+                rewards.append(timestep.reward)
+                dones.append(timestep.last())
+
+            all_rewards.append(rewards)
+            all_dones.append(dones)
+
+        # Convert lists to arrays and compute advantages
+        trajectories_data = {
+            'observations': all_observations,
+            'actions': jnp.array(all_actions),
+            'rewards': jnp.array(all_rewards),
+            'dones': jnp.array(all_dones),
+            'values': jnp.array(all_values),
+            'log_probs': jnp.array(all_log_probs)
         }
 
-        step_count = 0
+        # Compute advantages for each environment
+        advantages_list = []
+        returns_list = []
 
-        if render:
-            os.makedirs('results/plots', exist_ok=True)
-            self.env.render(state)
-            plt.savefig(f"results/plots/scenario_{scenario_seed}_step_0.png", dpi=150, bbox_inches='tight')
-            plt.close()
+        for env_idx in range(num_envs):
+            env_rewards = trajectories_data['rewards'][:, env_idx]
+            env_values = trajectories_data['values'][:, env_idx]
+            env_dones = trajectories_data['dones'][:, env_idx]
 
-        while not timestep.last() and step_count < max_steps:
-            # Get action mask from observation
-            action_mask = timestep.observation.action_mask
+            adv, ret = self.compute_gae(env_rewards, env_values, env_dones)
+            advantages_list.append(adv)
+            returns_list.append(ret)
 
-            # Select valid actions for all machines
-            key, action_key = jax.random.split(key)
-            action = self._select_valid_action(action_key, action_mask)
+        advantages = jnp.stack(advantages_list).T
+        returns = jnp.stack(returns_list).T
 
-            # Take a step
-            state, timestep = self.env.step(state, action)
-            step_count += 1
+        # Normalize advantages
+        if self.config.normalize_advantage:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # Store step information
-            step_info = {
-                'step': step_count,
-                'action': action.tolist(),
-                'reward': float(timestep.reward),
-                'done': bool(timestep.last())
-            }
-            scenario_info['steps'].append(step_info)
-            scenario_info['total_reward'] += float(timestep.reward)
+        return PPOTrajectory(
+            observations=trajectories_data['observations'],
+            actions=trajectories_data['actions'],
+            rewards=trajectories_data['rewards'],
+            dones=trajectories_data['dones'],
+            values=trajectories_data['values'],
+            log_probs=trajectories_data['log_probs'],
+            advantages=advantages,
+            returns=returns
+        )
 
-            # Debug print for first few steps
-            if step_count <= 3:
-                print(f"\nStep {step_count}:")
-                print(f"  Action: {action}")
-                print(f"  Reward: {timestep.reward}")
-                print(f"  Done: {timestep.last()}")
+    def ppo_loss(self, params, observations, actions, old_log_probs, advantages, returns):
+        """Compute PPO loss for a batch."""
+        # Evaluate actions with current policy
+        new_log_probs, values, entropy = jax.vmap(
+            partial(self.evaluate_actions, params)
+        )(observations, actions)
 
-            if render and step_count <= 5:  # Render first 5 steps
-                self.env.render(state)
-                plt.savefig(f"results/plots/scenario_{scenario_seed}_step_{step_count}.png", dpi=150,
-                            bbox_inches='tight')
-                plt.close()
+        # PPO clipped objective
+        ratio = jnp.exp(new_log_probs - old_log_probs)
+        clipped_ratio = jnp.clip(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon)
+        policy_loss = -jnp.minimum(
+            ratio * advantages,
+            clipped_ratio * advantages
+        ).mean()
 
-        scenario_info['episode_length'] = step_count
+        # Value loss
+        value_loss = 0.5 * ((values - returns) ** 2).mean()
 
-        # Calculate makespan from the final state
-        if hasattr(state, 'scheduled_times'):
-            # Find the maximum completion time
-            scheduled_times = state.scheduled_times
-            ops_durations = state.ops_durations
-            ops_mask = state.ops_mask
+        # Entropy bonus
+        entropy_loss = -entropy.mean()
 
-            completion_times = []
-            for job_idx in range(scheduled_times.shape[0]):
-                for op_idx in range(scheduled_times.shape[1]):
-                    if scheduled_times[job_idx, op_idx] >= 0:
-                        start_time = scheduled_times[job_idx, op_idx]
-                        duration = ops_durations[job_idx, op_idx]
-                        if duration > 0:  # Valid operation
-                            completion_time = start_time + duration
-                            completion_times.append(float(completion_time))
+        # Total loss
+        total_loss = (
+                policy_loss +
+                self.config.value_loss_coef * value_loss +
+                self.config.entropy_coef * entropy_loss
+        )
 
-            if completion_times:
-                scenario_info['makespan'] = max(completion_times)
-            else:
-                scenario_info['makespan'] = 0
-
-        print(f"\nScenario {scenario_seed} completed:")
-        print(f"  Steps: {step_count}")
-        print(f"  Total reward: {scenario_info['total_reward']:.2f}")
-        if scenario_info['makespan']:
-            print(f"  Makespan: {scenario_info['makespan']:.2f}")
-
-        return scenario_info
-
-    def run_multiple_scenarios(self, num_scenarios: int = 5, render_first: bool = True) -> List[Dict[str, Any]]:
-        """Run multiple scenarios with different random seeds."""
-        results = []
-
-        print(f"\nRunning {num_scenarios} scenarios with configuration:")
-        print(f"  - num_jobs: {self.env.num_jobs}")
-        print(f"  - num_machines: {self.env.num_machines}")
-        print(f"  - max_num_ops: {self.env.max_num_ops}")
-        print(f"  - max_op_duration: {self.env.max_op_duration}")
-
-        for scenario_id in tqdm(range(num_scenarios), desc="Running scenarios"):
-            render = render_first and (scenario_id == 0)
-            scenario_result = self.run_scenario(scenario_seed=scenario_id, render=render)
-            results.append(scenario_result)
-
-        return results
-
-    def run_with_heuristic(self, scenario_seed: int = 0, heuristic: str = "shortest_first") -> Dict[str, Any]:
-        """Run a scenario with a simple heuristic policy."""
-        key = jax.random.PRNGKey(scenario_seed)
-        state, timestep = self.env.reset(key)
-
-        scenario_info = {
-            'seed': scenario_seed,
-            'heuristic': heuristic,
-            'config': self.config['environment'],
-            'steps': [],
-            'total_reward': 0,
-            'episode_length': 0,
-            'makespan': None
+        metrics = {
+            'policy_loss': policy_loss,
+            'value_loss': value_loss,
+            'entropy': -entropy_loss,
+            'total_loss': total_loss,
+            'clip_fraction': (jnp.abs(ratio - 1) > self.config.clip_epsilon).mean()
         }
 
-        step_count = 0
+        return total_loss, metrics
 
-        while not timestep.last() and step_count < 1000:
-            action_mask = timestep.observation.action_mask
+    def update_ppo(self, params, opt_state, trajectories):
+        """Perform PPO update on collected trajectories."""
+        # Flatten trajectories for batch processing
+        n_steps, n_envs = trajectories.actions.shape[:2]
+        batch_size = n_steps * n_envs
 
-            # Apply heuristic
-            if heuristic == "shortest_first":
-                # For each machine, select the job with shortest operation duration
-                action = []
-                for machine_idx in range(self.env.num_machines):
-                    valid_jobs = jnp.where(action_mask[machine_idx])[0]
-                    if len(valid_jobs) > 0:
-                        # Get operation durations for valid jobs
-                        durations = []
-                        for job_id in valid_jobs:
-                            if job_id < self.env.num_jobs:  # Not a no-op
-                                # Find next operation for this job
-                                next_op_idx = jnp.argmax(state.ops_mask[job_id])
-                                if state.ops_machine_ids[job_id, next_op_idx] == machine_idx:
-                                    durations.append((job_id, state.ops_durations[job_id, next_op_idx]))
+        # Prepare batch data
+        batch_observations = []
+        for step in range(n_steps):
+            for env in range(n_envs):
+                batch_observations.append(trajectories.observations[step][env])
 
-                        if durations:
-                            # Select job with shortest duration
-                            selected_job = min(durations, key=lambda x: x[1])[0]
-                        else:
-                            # Select no-op if no valid operations
-                            selected_job = self.env.no_op_idx
-                    else:
-                        selected_job = self.env.no_op_idx
+        batch_actions = trajectories.actions.reshape(batch_size, -1)
+        batch_log_probs = trajectories.log_probs.reshape(batch_size)
+        batch_advantages = trajectories.advantages.reshape(batch_size)
+        batch_returns = trajectories.returns.reshape(batch_size)
 
-                    action.append(selected_job)
+        # Multiple epochs of updates
+        for epoch in range(self.config.update_epochs):
+            # Shuffle data
+            key = jax.random.PRNGKey(epoch)
+            indices = jax.random.permutation(key, batch_size)
 
-                action = jnp.array(action, dtype=jnp.int32)
-            else:
-                # Random selection (fallback)
+            # Update in minibatches
+            mb_size = batch_size // self.config.num_minibatches
+
+            for start in range(0, batch_size, mb_size):
+                end = min(start + mb_size, batch_size)
+                mb_indices = indices[start:end]
+
+                # Get minibatch
+                mb_observations = [batch_observations[i] for i in mb_indices]
+                mb_actions = batch_actions[mb_indices]
+                mb_log_probs = batch_log_probs[mb_indices]
+                mb_advantages = batch_advantages[mb_indices]
+                mb_returns = batch_returns[mb_indices]
+
+                # Compute loss and update
+                (loss, metrics), grads = jax.value_and_grad(
+                    self.ppo_loss, has_aux=True
+                )(params, mb_observations, mb_actions, mb_log_probs, mb_advantages, mb_returns)
+
+                updates, opt_state = self.optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+        return params, opt_state, metrics
+
+    def evaluate(self, params, num_episodes=32):
+        """Evaluate the current policy."""
+        total_rewards = []
+        makespans = []
+        episode_lengths = []
+
+        for i in range(num_episodes):
+            key = jax.random.PRNGKey(i * 1000)
+            state, timestep = self.env.reset(key)
+
+            episode_reward = 0
+            steps = 0
+
+            while not timestep.last() and steps < 1000:
                 key, action_key = jax.random.split(key)
-                action = self._select_valid_action(action_key, action_mask)
+                action, _, _, _ = self.act(params, timestep.observation, action_key)
+                state, timestep = self.env.step(state, action)
+                episode_reward += float(timestep.reward)
+                steps += 1
 
-            # Take a step
-            state, timestep = self.env.step(state, action)
-            step_count += 1
+            total_rewards.append(episode_reward)
+            episode_lengths.append(steps)
 
-            scenario_info['steps'].append({
-                'step': step_count,
-                'action': action.tolist(),
-                'reward': float(timestep.reward),
-                'done': bool(timestep.last())
-            })
-            scenario_info['total_reward'] += float(timestep.reward)
+            # Calculate makespan
+            if hasattr(state, 'scheduled_times') and hasattr(state, 'ops_durations'):
+                completion_times = []
+                for job_idx in range(state.scheduled_times.shape[0]):
+                    for op_idx in range(state.scheduled_times.shape[1]):
+                        if state.scheduled_times[job_idx, op_idx] >= 0:
+                            start_time = state.scheduled_times[job_idx, op_idx]
+                            duration = state.ops_durations[job_idx, op_idx]
+                            if duration > 0:
+                                completion_times.append(float(start_time + duration))
 
-        scenario_info['episode_length'] = step_count
+                if completion_times:
+                    makespans.append(max(completion_times))
 
-        # Calculate makespan
-        if hasattr(state, 'scheduled_times'):
-            scheduled_times = state.scheduled_times
-            ops_durations = state.ops_durations
+        return {
+            'mean_reward': np.mean(total_rewards),
+            'std_reward': np.std(total_rewards),
+            'mean_makespan': np.mean(makespans) if makespans else 0,
+            'std_makespan': np.std(makespans) if makespans else 0,
+            'mean_episode_length': np.mean(episode_lengths)
+        }
 
-            completion_times = []
-            for job_idx in range(scheduled_times.shape[0]):
-                for op_idx in range(scheduled_times.shape[1]):
-                    if scheduled_times[job_idx, op_idx] >= 0:
-                        start_time = scheduled_times[job_idx, op_idx]
-                        duration = ops_durations[job_idx, op_idx]
-                        if duration > 0:
-                            completion_times.append(float(start_time + duration))
+    def train(self):
+        """Main PPO training loop."""
+        # Initialize
+        key = jax.random.PRNGKey(42)
+        key, init_key = jax.random.split(key)
+        params = self.init_params(init_key)
+        opt_state = self.optimizer.init(params)
 
-            if completion_times:
-                scenario_info['makespan'] = max(completion_times)
+        # Training history
+        history = {
+            'epoch': [],
+            'policy_loss': [],
+            'value_loss': [],
+            'entropy': [],
+            'clip_fraction': [],
+            'mean_reward': [],
+            'mean_makespan': []
+        }
 
-        return scenario_info
+        # Initial evaluation
+        print("\nInitial Policy Evaluation:")
+        init_results = self.evaluate(params, num_episodes=32)
+        print(f"  Mean Reward: {init_results['mean_reward']:.2f}")
+        print(f"  Mean Makespan: {init_results['mean_makespan']:.2f}")
 
-    def analyze_results(self, results: List[Dict[str, Any]]):
-        """Analyze and print results from multiple scenarios."""
-        print("\n" + "=" * 60)
-        print("RESULTS ANALYSIS")
-        print("=" * 60)
+        # Training loop
+        for epoch in range(self.config.num_epochs):
+            epoch_metrics = {
+                'policy_loss': [],
+                'value_loss': [],
+                'entropy': [],
+                'clip_fraction': []
+            }
 
-        # Extract metrics
-        rewards = [r['total_reward'] for r in results]
-        lengths = [r['episode_length'] for r in results]
-        makespans = [r.get('makespan', 0) for r in results if r.get('makespan', 0) > 0]
+            # Multiple steps per epoch
+            for step in tqdm(range(self.config.num_learner_steps_per_epoch),
+                             desc=f"Epoch {epoch + 1}/{self.config.num_epochs}"):
 
-        print(f"\nTotal Scenarios Run: {len(results)}")
-        print(f"\nEpisode Lengths:")
-        print(f"  - Mean: {np.mean(lengths):.2f}")
-        print(f"  - Std: {np.std(lengths):.2f}")
-        print(f"  - Min: {min(lengths)}")
-        print(f"  - Max: {max(lengths)}")
+                # Collect trajectories
+                key, collect_key = jax.random.split(key)
+                num_envs = self.config.total_batch_size // self.config.n_steps
+                trajectories = self.collect_trajectories(params, collect_key, num_envs)
 
-        print(f"\nTotal Rewards:")
-        print(f"  - Mean: {np.mean(rewards):.2f}")
-        print(f"  - Std: {np.std(rewards):.2f}")
-        print(f"  - Min: {min(rewards):.2f}")
-        print(f"  - Max: {max(rewards):.2f}")
+                # PPO update
+                params, opt_state, metrics = self.update_ppo(params, opt_state, trajectories)
 
-        if makespans:
-            print(f"\nMakespans (completion time):")
-            print(f"  - Mean: {np.mean(makespans):.2f}")
-            print(f"  - Std: {np.std(makespans):.2f}")
-            print(f"  - Min: {min(makespans):.2f}")
-            print(f"  - Max: {max(makespans):.2f}")
+                # Store metrics
+                for k, v in metrics.items():
+                    if k != 'total_loss':
+                        epoch_metrics[k].append(float(v))
 
-        # Create plots
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            # Evaluate periodically
+            if (epoch + 1) % self.config.eval_frequency == 0:
+                eval_results = self.evaluate(params, num_episodes=self.config.eval_episodes)
 
-        # Episode lengths
-        axes[0, 0].bar(range(len(lengths)), lengths)
-        axes[0, 0].set_xlabel('Scenario')
-        axes[0, 0].set_ylabel('Episode Length')
-        axes[0, 0].set_title('Episode Lengths per Scenario')
-        axes[0, 0].grid(True, alpha=0.3)
+                # Store history
+                history['epoch'].append(epoch + 1)
+                history['mean_reward'].append(eval_results['mean_reward'])
+                history['mean_makespan'].append(eval_results['mean_makespan'])
 
-        # Rewards
-        axes[0, 1].bar(range(len(rewards)), rewards, color='orange')
-        axes[0, 1].set_xlabel('Scenario')
-        axes[0, 1].set_ylabel('Total Reward')
-        axes[0, 1].set_title('Total Rewards per Scenario')
-        axes[0, 1].grid(True, alpha=0.3)
+                for k, v in epoch_metrics.items():
+                    history[k].append(np.mean(v))
 
-        # Makespans
-        if makespans:
-            axes[1, 0].bar(range(len(makespans)), makespans, color='green')
-            axes[1, 0].set_xlabel('Scenario')
-            axes[1, 0].set_ylabel('Makespan')
-            axes[1, 0].set_title('Makespan per Scenario')
-            axes[1, 0].grid(True, alpha=0.3)
+                # Print progress
+                print(f"\nEpoch {epoch + 1}:")
+                print(f"  Policy Loss: {np.mean(epoch_metrics['policy_loss']):.4f}")
+                print(f"  Value Loss: {np.mean(epoch_metrics['value_loss']):.4f}")
+                print(f"  Entropy: {np.mean(epoch_metrics['entropy']):.4f}")
+                print(f"  Clip Fraction: {np.mean(epoch_metrics['clip_fraction']):.4f}")
+                print(f"  Mean Reward: {eval_results['mean_reward']:.2f} ± {eval_results['std_reward']:.2f}")
+                print(f"  Mean Makespan: {eval_results['mean_makespan']:.2f} ± {eval_results['std_makespan']:.2f}")
 
-        # Reward per step
-        reward_per_step = [r / l if l > 0 else 0 for r, l in zip(rewards, lengths)]
-        axes[1, 1].bar(range(len(reward_per_step)), reward_per_step, color='purple')
-        axes[1, 1].set_xlabel('Scenario')
-        axes[1, 1].set_ylabel('Reward per Step')
-        axes[1, 1].set_title('Average Reward per Step')
-        axes[1, 1].grid(True, alpha=0.3)
+        # Final evaluation
+        print("\nFinal Policy Evaluation:")
+        final_results = self.evaluate(params, num_episodes=100)
+        print(f"  Mean Reward: {final_results['mean_reward']:.2f} ± {final_results['std_reward']:.2f}")
+        print(f"  Mean Makespan: {final_results['mean_makespan']:.2f} ± {final_results['std_makespan']:.2f}")
+
+        return params, history, init_results, final_results
+
+    def visualize_training(self, history):
+        """Visualize PPO training progress."""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+        epochs = history['epoch']
+
+        # Policy loss
+        axes[0, 0].plot(epochs, history['policy_loss'])
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Policy Loss')
+        axes[0, 0].set_title('PPO Policy Loss')
+        axes[0, 0].grid(True)
+
+        # Value loss
+        axes[0, 1].plot(epochs, history['value_loss'])
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Value Loss')
+        axes[0, 1].set_title('Value Function Loss')
+        axes[0, 1].grid(True)
+
+        # Entropy
+        axes[0, 2].plot(epochs, history['entropy'])
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Entropy')
+        axes[0, 2].set_title('Policy Entropy')
+        axes[0, 2].grid(True)
+
+        # Clip fraction
+        axes[1, 0].plot(epochs, history['clip_fraction'])
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Clip Fraction')
+        axes[1, 0].set_title('PPO Clip Fraction')
+        axes[1, 0].grid(True)
+
+        # Reward
+        axes[1, 1].plot(epochs, history['mean_reward'])
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Mean Reward')
+        axes[1, 1].set_title('Average Episode Reward')
+        axes[1, 1].grid(True)
+
+        # Makespan
+        axes[1, 2].plot(epochs, history['mean_makespan'])
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Mean Makespan')
+        axes[1, 2].set_title('Average Makespan')
+        axes[1, 2].grid(True)
 
         plt.tight_layout()
-        plt.savefig('results/scenario_analysis.png', dpi=150, bbox_inches='tight')
+        plt.savefig('results/ppo_training_curves.png', dpi=150, bbox_inches='tight')
         plt.close()
 
-        print("\nAnalysis plots saved to 'results/scenario_analysis.png'")
+        print("\nTraining curves saved to 'results/ppo_training_curves.png'")
 
 
 def main():
-    # Create results directories
+    """Run PPO with official Jumanji networks."""
+    # Create results directory
     os.makedirs('results', exist_ok=True)
-    os.makedirs('results/plots', exist_ok=True)
 
-    # Create runner with configuration
-    config_path = 'configs/jobshop_config.yaml'
-    runner = JobShopRunner(config_path=config_path)
+    # Create PPO configuration
+    config = PPOConfig()
 
-    print("\n" + "=" * 60)
-    print("STARTING JOBSHOP EXPERIMENTS")
+    print("=" * 60)
+    print("PPO WITH OFFICIAL JUMANJI NETWORKS")
+    print("Single-Agent JobShop RL")
     print("=" * 60)
 
-    # Run random policy scenarios
-    print("\n1. Running with Random Policy:")
-    random_results = runner.run_multiple_scenarios(num_scenarios=5, render_first=True)
+    # Create and train PPO agent
+    agent = PPOJobShopRL(config)
 
-    # Run heuristic policy
-    print("\n2. Running with Shortest-First Heuristic:")
-    heuristic_results = []
-    for i in range(5):
-        result = runner.run_with_heuristic(scenario_seed=i, heuristic="shortest_first")
-        heuristic_results.append(result)
-        print(f"  Scenario {i}: Makespan = {result.get('makespan', 0):.0f}, Reward = {result['total_reward']:.0f}")
+    # Train
+    print("\nStarting PPO Training with Transformer Networks...")
+    trained_params, history, init_results, final_results = agent.train()
 
-    # Compare results
-    print("\n3. Comparison:")
-    random_makespans = [r.get('makespan', 0) for r in random_results if r.get('makespan', 0) > 0]
-    heuristic_makespans = [r.get('makespan', 0) for r in heuristic_results if r.get('makespan', 0) > 0]
+    # Visualize results
+    agent.visualize_training(history)
 
-    if random_makespans and heuristic_makespans:
-        print(f"  Random Policy Average Makespan: {np.mean(random_makespans):.2f}")
-        print(f"  Heuristic Policy Average Makespan: {np.mean(heuristic_makespans):.2f}")
-        improvement = (np.mean(random_makespans) - np.mean(heuristic_makespans)) / np.mean(random_makespans) * 100
-        print(f"  Improvement: {improvement:.1f}%")
+    # Calculate improvements
+    reward_improvement = final_results['mean_reward'] - init_results['mean_reward']
+    makespan_improvement = init_results['mean_makespan'] - final_results['mean_makespan']
 
-    # Analyze results
-    print("\nRandom Policy Results:")
-    runner.analyze_results(random_results)
-
-    # Save detailed results
-    all_results = {
-        'random_policy': random_results,
-        'heuristic_policy': heuristic_results
+    # Save comprehensive results
+    results = {
+        'algorithm': 'PPO with Official Jumanji Networks',
+        'network_architecture': {
+            'type': 'Transformer-based',
+            'num_layers_machines': config.num_layers_machines,
+            'num_layers_operations': config.num_layers_operations,
+            'num_layers_joint_machines_jobs': config.num_layers_joint_machines_jobs,
+            'transformer_num_heads': config.transformer_num_heads,
+            'transformer_key_size': config.transformer_key_size,
+            'transformer_mlp_units': config.transformer_mlp_units
+        },
+        'config': {
+            'num_jobs': config.num_jobs,
+            'num_machines': config.num_machines,
+            'max_num_ops': config.max_num_ops,
+            'max_op_duration': config.max_op_duration,
+            'num_epochs': config.num_epochs,
+            'learning_rate': config.learning_rate,
+            'clip_epsilon': config.clip_epsilon,
+            'discount_factor': config.discount_factor
+        },
+        'initial_performance': init_results,
+        'final_performance': final_results,
+        'training_history': history,
+        'improvements': {
+            'reward': reward_improvement,
+            'makespan': makespan_improvement,
+            'reward_percentage': (reward_improvement / abs(init_results['mean_reward'])) * 100,
+            'makespan_percentage': (makespan_improvement / init_results['mean_makespan']) * 100
+        }
     }
-    with open('results/all_scenario_results.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
 
-    print("\nDetailed results saved to 'results/all_scenario_results.json'")
-    print("\nExperiment completed successfully!")
+    with open('results/ppo_official_networks_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print("\nResults saved to 'results/ppo_official_networks_results.json'")
+    print(f"\nTraining Summary:")
+    print(f"  Reward Improvement: {reward_improvement:.2f} ({results['improvements']['reward_percentage']:.1f}%)")
+    print(f"  Makespan Improvement: {makespan_improvement:.2f} ({results['improvements']['makespan_percentage']:.1f}%)")
+
+    print("\n" + "=" * 60)
+    print("NETWORK ARCHITECTURE INSIGHTS")
+    print("=" * 60)
+    print("\nOfficial Jumanji Networks use:")
+    print("✓ Transformer blocks for machine embeddings")
+    print("✓ Self-attention between operations")
+    print("✓ Cross-attention between operations and machines")
+    print("✓ Positional encoding for operation sequences")
+    print("✓ Separate embeddings for jobs and machines")
+    print("✓ Multi-head attention mechanisms")
+    print("\nThis sophisticated architecture is designed to:")
+    print("- Capture complex dependencies between operations")
+    print("- Respect the sequential nature of job operations")
+    print("- Model machine-operation compatibility")
+    print("- Handle variable-length operation sequences")
 
 
 if __name__ == "__main__":
