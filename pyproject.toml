@@ -1,0 +1,49 @@
+[project]
+name = "jumanji-jobshop-experiments"
+version = "0.1.0"
+description = "JobShop scheduling experiments using Jumanji RL environment"
+authors = [{name = "Your Name", email = "your.email@example.com"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10,<3.13"  # ← This is the important change
+keywords = ["reinforcement-learning", "jobshop", "scheduling", "jumanji", "jax"]
+
+dependencies = [
+    "jumanji",
+    "jax[cpu]",
+    "jaxlib",
+    "matplotlib",
+    "numpy",
+    "tqdm",
+    "pyyaml",
+    "pandas",
+    "seaborn",
+    "wandb",
+    "hydra-core",
+    "omegaconf",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "flake8",
+    "mypy",
+    "pre-commit",
+    "jupyter",
+    "ipython",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']  # ← Also update this
+
+[tool.isort]
+profile = "black"
+line_length = 88
