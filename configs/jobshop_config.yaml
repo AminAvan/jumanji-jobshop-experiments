@@ -1,5 +1,9 @@
 environment:
   name: "JobShop-v0"
+  num_jobs: 5
+  num_machines: 4
+  max_num_ops: 4
+  max_op_duration: 4
 
 experiment:
   num_episodes: 100
