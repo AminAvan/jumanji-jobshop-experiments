@@ -164,6 +164,11 @@ class PPOJobShopRL:
         value = jnp.squeeze(value, axis=0)
         entropy = jnp.squeeze(entropy, axis=0)
 
+        # For MultiCategorical, log_prob has shape (num_machines,)
+        # We need to sum across machines to get a single log prob for the joint action
+        log_prob = jnp.sum(log_prob)
+        entropy = jnp.sum(entropy)
+
         return action, log_prob, value, entropy
 
     def act(self, params, obs, key):
@@ -183,6 +188,10 @@ class PPOJobShopRL:
         action_dist = self.networks.parametric_action_distribution.create_dist(logits)
         log_probs = action_dist.log_prob(actions_batch)
         entropy = action_dist.entropy()
+
+        # For MultiCategorical, sum log probs and entropy across machines
+        log_probs = jnp.sum(log_probs, axis=-1)  # Sum across machines
+        entropy = jnp.sum(entropy, axis=-1)  # Sum across machines
 
         return log_probs, values, entropy
 
@@ -257,9 +266,14 @@ class PPOJobShopRL:
                 values.append(value)
                 entropies.append(entropy)
 
-            all_actions.append(actions)
-            all_log_probs.append(log_probs)
-            all_values.append(values)
+            # Stack actions and values
+            actions_array = jnp.stack(actions)
+            log_probs_array = jnp.array(log_probs)
+            values_array = jnp.array(values)
+
+            all_actions.append(actions_array)
+            all_log_probs.append(log_probs_array)
+            all_values.append(values_array)
 
             # Step environments
             rewards = []
@@ -275,14 +289,14 @@ class PPOJobShopRL:
             all_rewards.append(rewards)
             all_dones.append(dones)
 
-        # Convert lists to arrays and compute advantages
+        # Convert lists to arrays
         trajectories_data = {
             'observations': all_observations,
-            'actions': jnp.array(all_actions),
+            'actions': jnp.stack(all_actions),  # (n_steps, num_envs, num_machines)
             'rewards': jnp.array(all_rewards),
             'dones': jnp.array(all_dones),
-            'values': jnp.array(all_values),
-            'log_probs': jnp.array(all_log_probs)
+            'values': jnp.stack(all_values),
+            'log_probs': jnp.stack(all_log_probs)  # (n_steps, num_envs)
         }
 
         # Compute advantages for each environment
@@ -392,8 +406,9 @@ class PPOJobShopRL:
             for env in range(n_envs):
                 batch_observations.append(trajectories.observations[step][env])
 
-        batch_actions = trajectories.actions.reshape(batch_size, -1)
-        batch_log_probs = trajectories.log_probs.reshape(batch_size)
+        # Flatten other arrays
+        batch_actions = trajectories.actions.reshape(batch_size, -1)  # (batch_size, num_machines)
+        batch_log_probs = trajectories.log_probs.reshape(batch_size)  # (batch_size,)
         batch_advantages = trajectories.advantages.reshape(batch_size)
         batch_returns = trajectories.returns.reshape(batch_size)
 
