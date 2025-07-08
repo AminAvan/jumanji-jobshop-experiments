@@ -1,1 +1,2 @@
+How to run the current code of JobShop in Jumanji with single-agent-reinforcement-learning method
 python src/jobshop_experiments/run_jobshop.py
