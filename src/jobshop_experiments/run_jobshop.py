@@ -18,6 +18,8 @@ import optax
 from functools import partial
 import chex
 import jax.tree_util as tree
+import time
+from datetime import datetime, timedelta
 
 
 @dataclass
@@ -39,15 +41,15 @@ class PPOConfig:
 
     # Training config
     num_epochs: int = 65
-    num_learner_steps_per_epoch: int = 50  # Down from 200
+    num_learner_steps_per_epoch: int = 50
     n_steps: int = 10
     total_batch_size: int = 128
     num_minibatches: int = 4
     update_epochs: int = 4
 
     # Evaluation config
-    eval_episodes: int = 16  # Down from 32
-    eval_frequency: int = 10  # Evaluate every 10 epochs instead of 5
+    eval_episodes: int = 16
+    eval_frequency: int = 10
 
     # PPO hyperparameters
     learning_rate: float = 1e-4
@@ -58,6 +60,10 @@ class PPOConfig:
     entropy_coef: float = 0.5
     max_grad_norm: float = 0.5
     normalize_advantage: bool = True
+
+    # Logging config
+    log_frequency: int = 10  # Log every N steps
+    log_detailed_metrics: bool = True
 
     def __post_init__(self):
         if self.transformer_mlp_units is None:
@@ -74,6 +80,185 @@ class PPOTrajectory(NamedTuple):
     log_probs: jnp.ndarray
     advantages: jnp.ndarray
     returns: jnp.ndarray
+    episode_lengths: jnp.ndarray  # Added for logging
+    episode_returns: jnp.ndarray  # Added for logging
+
+
+class MetricsLogger:
+    """Logger for training metrics with timing."""
+
+    def __init__(self, log_frequency=10):
+        self.start_time = time.time()
+        self.total_steps = 0
+        self.training_step = 0  # Track training steps separately
+        self.actor_metrics = []
+        self.trainer_metrics = []
+        self.evaluator_metrics = []
+        self.log_frequency = log_frequency
+
+        # Buffers for accumulating metrics between logs
+        self.actor_buffer = []
+        self.trainer_buffer = []
+        self.pending_logs = False
+
+    def get_elapsed_time(self):
+        """Get elapsed time in seconds."""
+        return time.time() - self.start_time
+
+    def format_time(self, seconds):
+        """Format seconds to human-readable string."""
+        return str(timedelta(seconds=int(seconds)))
+
+    def increment_training_step(self):
+        """Increment the training step counter."""
+        self.training_step += 1
+
+    def should_log(self):
+        """Check if we should log based on training steps."""
+        return self.training_step % self.log_frequency == 0
+
+    def log_actor_metrics(self, steps, episode_returns, episode_lengths, steps_per_second, force_log=False):
+        """Log actor/collector metrics."""
+        self.total_steps += steps
+
+        # Always accumulate metrics
+        metrics = {
+            'time': self.get_elapsed_time(),
+            'total_steps': self.total_steps,
+            'steps_per_second': steps_per_second,
+            'episode_length_mean': np.mean(episode_lengths) if len(episode_lengths) > 0 else 0,
+            'episode_length_std': np.std(episode_lengths) if len(episode_lengths) > 0 else 0,
+            'episode_length_min': np.min(episode_lengths) if len(episode_lengths) > 0 else 0,
+            'episode_length_max': np.max(episode_lengths) if len(episode_lengths) > 0 else 0,
+            'episode_return_mean': np.mean(episode_returns) if len(episode_returns) > 0 else 0,
+            'episode_return_std': np.std(episode_returns) if len(episode_returns) > 0 else 0,
+            'episode_return_min': np.min(episode_returns) if len(episode_returns) > 0 else 0,
+            'episode_return_max': np.max(episode_returns) if len(episode_returns) > 0 else 0,
+        }
+
+        self.actor_buffer.append(metrics)
+        self.pending_logs = True
+
+    def log_trainer_metrics(self, policy_loss, value_loss, entropy, total_loss, force_log=False):
+        """Log trainer/update metrics."""
+        metrics = {
+            'time': self.get_elapsed_time(),
+            'total_steps': self.total_steps,
+            'policy_loss': policy_loss,
+            'value_loss': value_loss,
+            'entropy': entropy,
+            'total_loss': total_loss,
+        }
+
+        self.trainer_buffer.append(metrics)
+
+        # Increment training step
+        self.increment_training_step()
+
+        # Check if we should print logs
+        if self.should_log() or force_log:
+            self._print_buffered_logs()
+
+    def _print_buffered_logs(self):
+        """Print all buffered logs."""
+        # Print actor metrics if available
+        if self.actor_buffer:
+            avg_metrics = self._average_metrics(self.actor_buffer)
+            self.actor_metrics.append(avg_metrics)
+
+            # Print both total steps and elapsed time in seconds
+            elapsed_seconds = int(self.get_elapsed_time())
+            print(f"\nTime: {self.total_steps} | Elapsed: {elapsed_seconds}s")
+            print(f"ACTOR - Steps per second: {avg_metrics['steps_per_second']:.3f} | "
+                  f"Episode length mean: {avg_metrics['episode_length_mean']:.3f} | "
+                  f"Episode length std: {avg_metrics['episode_length_std']:.3f} | "
+                  f"Episode length min: {int(avg_metrics['episode_length_min'])} | "
+                  f"Episode length max: {int(avg_metrics['episode_length_max'])} | "
+                  f"Episode return mean: {avg_metrics['episode_return_mean']:.3f} | "
+                  f"Episode return std: {avg_metrics['episode_return_std']:.3f} | "
+                  f"Episode return min: {avg_metrics['episode_return_min']:.3f} | "
+                  f"Episode return max: {avg_metrics['episode_return_max']:.3f}")
+
+            self.actor_buffer = []
+
+        # Print trainer metrics if available
+        if self.trainer_buffer:
+            avg_metrics = self._average_metrics(self.trainer_buffer)
+            self.trainer_metrics.append(avg_metrics)
+
+            print(f"TRAINER - Actor loss: {avg_metrics['policy_loss']:.3f} | "
+                  f"Entropy: {avg_metrics['entropy']:.3f} | "
+                  f"Total loss: {avg_metrics['total_loss']:.3f} | "
+                  f"Value loss: {avg_metrics['value_loss']:.3f}")
+
+            self.trainer_buffer = []
+
+        self.pending_logs = False
+
+    def flush_logs(self):
+        """Force print any pending logs."""
+        if self.pending_logs:
+            self._print_buffered_logs()
+
+    def log_evaluator_metrics(self, episode_returns, episode_lengths, eval_time):
+        """Log evaluator metrics."""
+        total_steps = sum(episode_lengths)
+        steps_per_second = total_steps / eval_time if eval_time > 0 else 0
+
+        metrics = {
+            'time': self.get_elapsed_time(),
+            'total_steps': self.total_steps,
+            'steps_per_second': steps_per_second,
+            'episode_length_mean': np.mean(episode_lengths),
+            'episode_length_std': np.std(episode_lengths),
+            'episode_length_min': np.min(episode_lengths),
+            'episode_length_max': np.max(episode_lengths),
+            'episode_return_mean': np.mean(episode_returns),
+            'episode_return_std': np.std(episode_returns),
+            'episode_return_min': np.min(episode_returns),
+            'episode_return_max': np.max(episode_returns),
+        }
+
+        self.evaluator_metrics.append(metrics)
+
+        # Always print evaluator metrics
+        print(f"EVALUATOR - Steps per second: {steps_per_second:.3f} | "
+              f"Episode length mean: {metrics['episode_length_mean']:.3f} | "
+              f"Episode length std: {metrics['episode_length_std']:.3f} | "
+              f"Episode length min: {int(metrics['episode_length_min'])} | "
+              f"Episode length max: {int(metrics['episode_length_max'])} | "
+              f"Episode return mean: {metrics['episode_return_mean']:.3f} | "
+              f"Episode return std: {metrics['episode_return_std']:.3f} | "
+              f"Episode return min: {metrics['episode_return_min']:.3f} | "
+              f"Episode return max: {metrics['episode_return_max']:.3f}")
+
+    def _average_metrics(self, metrics_list):
+        """Average a list of metrics dictionaries."""
+        if not metrics_list:
+            return {}
+
+        avg_metrics = {}
+        for key in metrics_list[0].keys():
+            if key in ['time', 'total_steps']:
+                # For time and total_steps, take the latest value
+                avg_metrics[key] = metrics_list[-1][key]
+            elif key in ['episode_length_min', 'episode_return_min']:
+                # For min values, take the minimum across all
+                valid_values = [m[key] for m in metrics_list if m[key] != 0]
+                avg_metrics[key] = min(valid_values) if valid_values else 0
+            elif key in ['episode_length_max', 'episode_return_max']:
+                # For max values, take the maximum across all
+                valid_values = [m[key] for m in metrics_list if m[key] != 0]
+                avg_metrics[key] = max(valid_values) if valid_values else 0
+            else:
+                # For other metrics, average them (excluding zeros for episode metrics)
+                if 'episode' in key:
+                    valid_values = [m[key] for m in metrics_list if m[key] != 0]
+                    avg_metrics[key] = np.mean(valid_values) if valid_values else 0
+                else:
+                    avg_metrics[key] = np.mean([m[key] for m in metrics_list])
+
+        return avg_metrics
 
 
 def add_batch_dim(observation):
@@ -91,6 +276,7 @@ class PPOJobShopRL:
 
     def __init__(self, config: PPOConfig):
         self.config = config
+        self.logger = MetricsLogger(log_frequency=config.log_frequency)
 
         # Create environment
         generator = RandomGenerator(
@@ -123,6 +309,7 @@ class PPOJobShopRL:
         print(f"  - Network: Transformer-based with {config.transformer_num_heads} heads")
         print(f"  - Training epochs: {config.num_epochs}")
         print(f"  - PPO clip epsilon: {config.clip_epsilon}")
+        print(f"  - Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     def init_params(self, key: chex.PRNGKey):
         """Initialize network parameters."""
@@ -220,6 +407,8 @@ class PPOJobShopRL:
 
     def collect_trajectories(self, params, key, num_envs):
         """Collect trajectories using current policy."""
+        collect_start_time = time.time()
+
         # Initialize environments
         keys = jax.random.split(key, num_envs + 1)
         key = keys[0]
@@ -241,6 +430,12 @@ class PPOJobShopRL:
         all_dones = []
         all_values = []
         all_log_probs = []
+
+        # Episode tracking
+        episode_returns = [0.0] * num_envs
+        episode_lengths = [0] * num_envs
+        completed_returns = []
+        completed_lengths = []
 
         # Collect n_steps of experience
         for step in range(self.config.n_steps):
@@ -283,8 +478,30 @@ class PPOJobShopRL:
                 state, timestep = self.env.step(states[i], actions[i])
                 states[i] = state
                 timesteps[i] = timestep
-                rewards.append(timestep.reward)
-                dones.append(timestep.last())
+
+                reward = float(timestep.reward)  # Ensure float
+                done = timestep.last()
+
+                rewards.append(reward)
+                dones.append(done)
+
+                # Track episodes
+                episode_returns[i] += reward
+                episode_lengths[i] += 1
+
+                if done:
+                    completed_returns.append(episode_returns[i])
+                    completed_lengths.append(episode_lengths[i])
+
+                    # Reset for new episode
+                    key, reset_key = jax.random.split(key)
+                    state, timestep = self.env.reset(reset_key)
+                    states[i] = state
+                    timesteps[i] = timestep
+
+                    # Reset tracking for new episode
+                    episode_returns[i] = 0.0
+                    episode_lengths[i] = 0
 
             all_rewards.append(rewards)
             all_dones.append(dones)
@@ -292,11 +509,11 @@ class PPOJobShopRL:
         # Convert lists to arrays
         trajectories_data = {
             'observations': all_observations,
-            'actions': jnp.stack(all_actions),  # (n_steps, num_envs, num_machines)
+            'actions': jnp.stack(all_actions),
             'rewards': jnp.array(all_rewards),
             'dones': jnp.array(all_dones),
             'values': jnp.stack(all_values),
-            'log_probs': jnp.stack(all_log_probs)  # (n_steps, num_envs)
+            'log_probs': jnp.stack(all_log_probs)
         }
 
         # Compute advantages for each environment
@@ -319,6 +536,19 @@ class PPOJobShopRL:
         if self.config.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Calculate collection time and steps per second
+        collect_time = time.time() - collect_start_time
+        total_steps = self.config.n_steps * num_envs
+        steps_per_second = total_steps / collect_time if collect_time > 0 else 0
+
+        # Log actor metrics if we have completed episodes or use empty lists
+        self.logger.log_actor_metrics(
+            steps=total_steps,
+            episode_returns=completed_returns if completed_returns else [0.0],
+            episode_lengths=completed_lengths if completed_lengths else [0],
+            steps_per_second=steps_per_second
+        )
+
         return PPOTrajectory(
             observations=trajectories_data['observations'],
             actions=trajectories_data['actions'],
@@ -327,7 +557,9 @@ class PPOJobShopRL:
             values=trajectories_data['values'],
             log_probs=trajectories_data['log_probs'],
             advantages=advantages,
-            returns=returns
+            returns=returns,
+            episode_lengths=jnp.array(completed_lengths) if completed_lengths else jnp.array([0]),
+            episode_returns=jnp.array(completed_returns) if completed_returns else jnp.array([0.0])
         )
 
     def create_minibatch(self, observations_list, batch_indices):
@@ -407,8 +639,8 @@ class PPOJobShopRL:
                 batch_observations.append(trajectories.observations[step][env])
 
         # Flatten other arrays
-        batch_actions = trajectories.actions.reshape(batch_size, -1)  # (batch_size, num_machines)
-        batch_log_probs = trajectories.log_probs.reshape(batch_size)  # (batch_size,)
+        batch_actions = trajectories.actions.reshape(batch_size, -1)
+        batch_log_probs = trajectories.log_probs.reshape(batch_size)
         batch_advantages = trajectories.advantages.reshape(batch_size)
         batch_returns = trajectories.returns.reshape(batch_size)
 
@@ -449,10 +681,20 @@ class PPOJobShopRL:
             *all_metrics
         )
 
+        # Log trainer metrics
+        self.logger.log_trainer_metrics(
+            policy_loss=float(avg_metrics['policy_loss']),
+            value_loss=float(avg_metrics['value_loss']),
+            entropy=float(avg_metrics['entropy']),
+            total_loss=float(avg_metrics['total_loss'])
+        )
+
         return params, opt_state, avg_metrics
 
     def evaluate(self, params, num_episodes=32):
         """Evaluate the current policy."""
+        eval_start_time = time.time()
+
         total_rewards = []
         makespans = []
         episode_lengths = []
@@ -461,7 +703,7 @@ class PPOJobShopRL:
             key = jax.random.PRNGKey(i * 1000)
             state, timestep = self.env.reset(key)
 
-            episode_reward = 0
+            episode_reward = 0.0
             steps = 0
 
             while not timestep.last() and steps < 1000:
@@ -474,7 +716,7 @@ class PPOJobShopRL:
             total_rewards.append(episode_reward)
             episode_lengths.append(steps)
 
-            # Calculate makespan
+            # Calculate makespan from the final state
             if hasattr(state, 'scheduled_times') and hasattr(state, 'ops_durations'):
                 completion_times = []
                 for job_idx in range(state.scheduled_times.shape[0]):
@@ -487,13 +729,26 @@ class PPOJobShopRL:
 
                 if completion_times:
                     makespans.append(max(completion_times))
+                else:
+                    # If no completion times found, use negative reward as proxy
+                    makespans.append(-episode_reward)
+
+        eval_time = time.time() - eval_start_time
+
+        # Log evaluator metrics
+        if total_rewards:  # Only log if we have completed episodes
+            self.logger.log_evaluator_metrics(
+                episode_returns=total_rewards,
+                episode_lengths=episode_lengths,
+                eval_time=eval_time
+            )
 
         return {
-            'mean_reward': np.mean(total_rewards),
-            'std_reward': np.std(total_rewards),
-            'mean_makespan': np.mean(makespans) if makespans else 0,
-            'std_makespan': np.std(makespans) if makespans else 0,
-            'mean_episode_length': np.mean(episode_lengths)
+            'mean_reward': np.mean(total_rewards) if total_rewards else 0.0,
+            'std_reward': np.std(total_rewards) if total_rewards else 0.0,
+            'mean_makespan': np.mean(makespans) if makespans else 0.0,
+            'std_makespan': np.std(makespans) if makespans else 0.0,
+            'mean_episode_length': np.mean(episode_lengths) if episode_lengths else 0.0
         }
 
     def train(self):
@@ -512,7 +767,9 @@ class PPOJobShopRL:
             'entropy': [],
             'clip_fraction': [],
             'mean_reward': [],
-            'mean_makespan': []
+            'mean_makespan': [],
+            'elapsed_time': [],
+            'total_steps': []
         }
 
         # Initial evaluation
@@ -520,6 +777,7 @@ class PPOJobShopRL:
         init_results = self.evaluate(params, num_episodes=32)
         print(f"  Mean Reward: {init_results['mean_reward']:.2f}")
         print(f"  Mean Makespan: {init_results['mean_makespan']:.2f}")
+        print(f"  Elapsed Time: {self.logger.format_time(self.logger.get_elapsed_time())}")
 
         # Training loop
         for epoch in range(self.config.num_epochs):
@@ -547,6 +805,9 @@ class PPOJobShopRL:
                     if k != 'total_loss':
                         epoch_metrics[k].append(float(v))
 
+            # Force print any remaining logs at end of epoch
+            self.logger.flush_logs()
+
             # Evaluate periodically
             if (epoch + 1) % self.config.eval_frequency == 0:
                 eval_results = self.evaluate(params, num_episodes=self.config.eval_episodes)
@@ -555,30 +816,48 @@ class PPOJobShopRL:
                 history['epoch'].append(epoch + 1)
                 history['mean_reward'].append(eval_results['mean_reward'])
                 history['mean_makespan'].append(eval_results['mean_makespan'])
+                history['elapsed_time'].append(self.logger.get_elapsed_time())
+                history['total_steps'].append(self.logger.total_steps)
 
                 for k, v in epoch_metrics.items():
                     history[k].append(np.mean(v))
 
-                # Print progress
-                print(f"\nEpoch {epoch + 1}:")
+                # Print progress with timing
+                print(f"\n{'=' * 80}")
+                print(f"Epoch {epoch + 1} Summary:")
+                print(f"  Elapsed Time: {self.logger.format_time(self.logger.get_elapsed_time())}")
+                print(f"  Total Steps: {self.logger.total_steps}")
                 print(f"  Policy Loss: {np.mean(epoch_metrics['policy_loss']):.4f}")
                 print(f"  Value Loss: {np.mean(epoch_metrics['value_loss']):.4f}")
                 print(f"  Entropy: {np.mean(epoch_metrics['entropy']):.4f}")
                 print(f"  Clip Fraction: {np.mean(epoch_metrics['clip_fraction']):.4f}")
                 print(f"  Mean Reward: {eval_results['mean_reward']:.2f} ± {eval_results['std_reward']:.2f}")
                 print(f"  Mean Makespan: {eval_results['mean_makespan']:.2f} ± {eval_results['std_makespan']:.2f}")
+                print(f"{'=' * 80}")
 
         # Final evaluation
         print("\nFinal Policy Evaluation:")
         final_results = self.evaluate(params, num_episodes=100)
         print(f"  Mean Reward: {final_results['mean_reward']:.2f} ± {final_results['std_reward']:.2f}")
         print(f"  Mean Makespan: {final_results['mean_makespan']:.2f} ± {final_results['std_makespan']:.2f}")
+        print(f"  Total Training Time: {self.logger.format_time(self.logger.get_elapsed_time())}")
+        print(f"  Total Steps: {self.logger.total_steps}")
 
-        return params, history, init_results, final_results
+        # Save all metrics
+        all_metrics = {
+            'history': history,
+            'actor_metrics': self.logger.actor_metrics,
+            'trainer_metrics': self.logger.trainer_metrics,
+            'evaluator_metrics': self.logger.evaluator_metrics,
+            'total_training_time': self.logger.get_elapsed_time(),
+            'total_steps': self.logger.total_steps
+        }
+
+        return params, all_metrics, init_results, final_results
 
     def visualize_training(self, history):
-        """Visualize PPO training progress."""
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        """Visualize PPO training progress including timing information."""
+        fig, axes = plt.subplots(3, 3, figsize=(20, 15))
 
         epochs = history['epoch']
 
@@ -624,11 +903,36 @@ class PPOJobShopRL:
         axes[1, 2].set_title('Average Makespan')
         axes[1, 2].grid(True)
 
+        # Total steps over time
+        axes[2, 0].plot(history['elapsed_time'], history['total_steps'])
+        axes[2, 0].set_xlabel('Time (seconds)')
+        axes[2, 0].set_ylabel('Total Steps')
+        axes[2, 0].set_title('Steps vs Time')
+        axes[2, 0].grid(True)
+
+        # Steps per second over epochs
+        if len(history['elapsed_time']) > 1:
+            steps_diff = np.diff(history['total_steps'])
+            time_diff = np.diff(history['elapsed_time'])
+            steps_per_sec = steps_diff / time_diff
+            axes[2, 1].plot(epochs[1:], steps_per_sec)
+            axes[2, 1].set_xlabel('Epoch')
+            axes[2, 1].set_ylabel('Steps per Second')
+            axes[2, 1].set_title('Training Speed')
+            axes[2, 1].grid(True)
+
+        # Reward vs total steps
+        axes[2, 2].plot(history['total_steps'], history['mean_reward'])
+        axes[2, 2].set_xlabel('Total Steps')
+        axes[2, 2].set_ylabel('Mean Reward')
+        axes[2, 2].set_title('Reward Progress vs Steps')
+        axes[2, 2].grid(True)
+
         plt.tight_layout()
-        plt.savefig('results/ppo_training_curves.png', dpi=150, bbox_inches='tight')
+        plt.savefig('results/ppo_training_curves_with_timing.png', dpi=150, bbox_inches='tight')
         plt.close()
 
-        print("\nTraining curves saved to 'results/ppo_training_curves.png'")
+        print("\nTraining curves saved to 'results/ppo_training_curves_with_timing.png'")
 
 
 def main():
@@ -641,7 +945,7 @@ def main():
 
     print("=" * 60)
     print("PPO WITH OFFICIAL JUMANJI NETWORKS")
-    print("Single-Agent JobShop RL")
+    print("Single-Agent JobShop RL with Detailed Logging")
     print("=" * 60)
 
     # Create and train PPO agent
@@ -649,10 +953,10 @@ def main():
 
     # Train
     print("\nStarting PPO Training with Transformer Networks...")
-    trained_params, history, init_results, final_results = agent.train()
+    trained_params, all_metrics, init_results, final_results = agent.train()
 
     # Visualize results
-    agent.visualize_training(history)
+    agent.visualize_training(all_metrics['history'])
 
     # Calculate improvements
     reward_improvement = final_results['mean_reward'] - init_results['mean_reward']
@@ -682,7 +986,7 @@ def main():
         },
         'initial_performance': init_results,
         'final_performance': final_results,
-        'training_history': history,
+        'training_metrics': all_metrics,
         'improvements': {
             'reward': reward_improvement,
             'makespan': makespan_improvement,
@@ -693,11 +997,30 @@ def main():
         }
     }
 
-    with open('results/ppo_official_networks_results.json', 'w') as f:
+    # Convert numpy types to Python types for JSON serialization
+    def convert_to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        return obj
+
+    results = convert_to_serializable(results)
+
+    with open('results/ppo_official_networks_results_with_timing.json', 'w') as f:
         json.dump(results, f, indent=2)
 
-    print("\nResults saved to 'results/ppo_official_networks_results.json'")
+    print("\nResults saved to 'results/ppo_official_networks_results_with_timing.json'")
     print(f"\nTraining Summary:")
+    print(f"  Total Training Time: {timedelta(seconds=int(all_metrics['total_training_time']))}")
+    print(f"  Total Steps: {all_metrics['total_steps']:,}")
+    print(f"  Average Steps/Second: {all_metrics['total_steps'] / all_metrics['total_training_time']:.2f}")
     print(f"  Reward Improvement: {reward_improvement:.2f} ({results['improvements']['reward_percentage']:.1f}%)")
     print(f"  Makespan Improvement: {makespan_improvement:.2f} ({results['improvements']['makespan_percentage']:.1f}%)")
 
