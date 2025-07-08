@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import jumanji
 from jumanji.environments.packing.job_shop import JobShop
 from jumanji.environments.packing.job_shop.generator import RandomGenerator, ToyGenerator
-from jumanji.training.networks.job_shop import make_actor_critic_networks_job_shop
+# Fix the import - import directly from the actor_critic module
+from jumanji.training.networks.job_shop.actor_critic import make_actor_critic_networks_job_shop
 from jumanji.training.networks.actor_critic import ActorCriticNetworks
 import haiku as hk
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
@@ -610,8 +611,10 @@ def main():
         'improvements': {
             'reward': reward_improvement,
             'makespan': makespan_improvement,
-            'reward_percentage': (reward_improvement / abs(init_results['mean_reward'])) * 100,
-            'makespan_percentage': (makespan_improvement / init_results['mean_makespan']) * 100
+            'reward_percentage': (reward_improvement / abs(init_results['mean_reward'])) * 100 if init_results[
+                                                                                                      'mean_reward'] != 0 else 0,
+            'makespan_percentage': (makespan_improvement / init_results['mean_makespan']) * 100 if init_results[
+                                                                                                       'mean_makespan'] != 0 else 0
         }
     }
 
