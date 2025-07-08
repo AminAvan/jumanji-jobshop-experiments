@@ -3,7 +3,6 @@ import jax.numpy as jnp
 import jumanji
 from jumanji.environments.packing.job_shop import JobShop
 from jumanji.environments.packing.job_shop.generator import RandomGenerator, ToyGenerator
-# Fix the import - import directly from the actor_critic module
 from jumanji.training.networks.job_shop.actor_critic import make_actor_critic_networks_job_shop
 from jumanji.training.networks.actor_critic import ActorCriticNetworks
 import haiku as hk
@@ -18,6 +17,7 @@ from dataclasses import dataclass
 import optax
 from functools import partial
 import chex
+import jax.tree_util as tree
 
 
 @dataclass
@@ -76,6 +76,16 @@ class PPOTrajectory(NamedTuple):
     returns: jnp.ndarray
 
 
+def add_batch_dim(observation):
+    """Add batch dimension to observation."""
+    return tree.tree_map(lambda x: jnp.expand_dims(x, axis=0), observation)
+
+
+def remove_batch_dim(observation):
+    """Remove batch dimension from observation."""
+    return tree.tree_map(lambda x: jnp.squeeze(x, axis=0), observation)
+
+
 class PPOJobShopRL:
     """PPO implementation using Jumanji's official JobShop networks."""
 
@@ -116,22 +126,25 @@ class PPOJobShopRL:
 
     def init_params(self, key: chex.PRNGKey):
         """Initialize network parameters."""
-        key1, key2 = jax.random.split(key)
+        key1, key2, key3 = jax.random.split(key, 3)
 
         # Get a dummy observation to initialize networks
         dummy_state, dummy_timestep = self.env.reset(key1)
         dummy_obs = dummy_timestep.observation
 
-        # Initialize both actor and critic networks
-        policy_params = self.networks.policy_network.init(key2, dummy_obs)
-        value_params = self.networks.value_network.init(key2, dummy_obs)
+        # Add batch dimension for initialization
+        batched_obs = add_batch_dim(dummy_obs)
+
+        # Initialize both actor and critic networks with batched observation
+        policy_params = self.networks.policy_network.init(key2, batched_obs)
+        value_params = self.networks.value_network.init(key3, batched_obs)
 
         return {'policy': policy_params, 'value': value_params}
 
     @partial(jax.jit, static_argnums=(0,))
-    def act(self, params, obs, key):
-        """Select action using the policy network."""
-        # Get action logits from policy network
+    def act_single(self, params, obs, key):
+        """Select action for a single observation (with batch dim)."""
+        # Observation should already have batch dimension
         logits = self.networks.policy_network.apply(params['policy'], obs)
 
         # Sample action from the distribution
@@ -145,18 +158,30 @@ class PPOJobShopRL:
         # Compute entropy for regularization
         entropy = action_dist.entropy()
 
+        # Remove batch dimension from outputs
+        action = jnp.squeeze(action, axis=0)
+        log_prob = jnp.squeeze(log_prob, axis=0)
+        value = jnp.squeeze(value, axis=0)
+        entropy = jnp.squeeze(entropy, axis=0)
+
         return action, log_prob, value, entropy
 
+    def act(self, params, obs, key):
+        """Select action for a single observation."""
+        # Add batch dimension
+        batched_obs = add_batch_dim(obs)
+        return self.act_single(params, batched_obs, key)
+
     @partial(jax.jit, static_argnums=(0,))
-    def evaluate_actions(self, params, obs, actions):
-        """Evaluate actions for PPO loss computation."""
-        # Get action logits and values
-        logits = self.networks.policy_network.apply(params['policy'], obs)
-        values = self.networks.value_network.apply(params['value'], obs)
+    def evaluate_actions_batch(self, params, obs_batch, actions_batch):
+        """Evaluate actions for a batch of observations."""
+        # Get action logits and values for the batch
+        logits = self.networks.policy_network.apply(params['policy'], obs_batch)
+        values = self.networks.value_network.apply(params['value'], obs_batch)
 
         # Create distribution and compute log probs
         action_dist = self.networks.parametric_action_distribution.create_dist(logits)
-        log_probs = action_dist.log_prob(actions)
+        log_probs = action_dist.log_prob(actions_batch)
         entropy = action_dist.entropy()
 
         return log_probs, values, entropy
@@ -291,12 +316,38 @@ class PPOJobShopRL:
             returns=returns
         )
 
-    def ppo_loss(self, params, observations, actions, old_log_probs, advantages, returns):
+    def create_minibatch(self, observations_list, batch_indices):
+        """Create a minibatch with proper structure."""
+        # Stack observations for the minibatch
+        batch_obs = []
+        for idx in batch_indices:
+            obs = observations_list[idx]
+            batch_obs.append(obs)
+
+        # Stack all observation fields
+        if batch_obs:
+            # Get the structure from the first observation
+            first_obs = batch_obs[0]
+
+            # Stack each field of the observation
+            stacked_obs = type(first_obs)(
+                ops_machine_ids=jnp.stack([obs.ops_machine_ids for obs in batch_obs]),
+                ops_durations=jnp.stack([obs.ops_durations for obs in batch_obs]),
+                ops_mask=jnp.stack([obs.ops_mask for obs in batch_obs]),
+                machines_job_ids=jnp.stack([obs.machines_job_ids for obs in batch_obs]),
+                machines_remaining_times=jnp.stack([obs.machines_remaining_times for obs in batch_obs]),
+                action_mask=jnp.stack([obs.action_mask for obs in batch_obs])
+            )
+            return stacked_obs
+        else:
+            return None
+
+    def ppo_loss(self, params, obs_batch, actions_batch, old_log_probs, advantages, returns):
         """Compute PPO loss for a batch."""
         # Evaluate actions with current policy
-        new_log_probs, values, entropy = jax.vmap(
-            partial(self.evaluate_actions, params)
-        )(observations, actions)
+        new_log_probs, values, entropy = self.evaluate_actions_batch(
+            params, obs_batch, actions_batch
+        )
 
         # PPO clipped objective
         ratio = jnp.exp(new_log_probs - old_log_probs)
@@ -335,7 +386,7 @@ class PPOJobShopRL:
         n_steps, n_envs = trajectories.actions.shape[:2]
         batch_size = n_steps * n_envs
 
-        # Prepare batch data
+        # Flatten all observations into a single list
         batch_observations = []
         for step in range(n_steps):
             for env in range(n_envs):
@@ -347,6 +398,7 @@ class PPOJobShopRL:
         batch_returns = trajectories.returns.reshape(batch_size)
 
         # Multiple epochs of updates
+        all_metrics = []
         for epoch in range(self.config.update_epochs):
             # Shuffle data
             key = jax.random.PRNGKey(epoch)
@@ -359,8 +411,8 @@ class PPOJobShopRL:
                 end = min(start + mb_size, batch_size)
                 mb_indices = indices[start:end]
 
-                # Get minibatch
-                mb_observations = [batch_observations[i] for i in mb_indices]
+                # Create minibatch with proper structure
+                mb_observations = self.create_minibatch(batch_observations, mb_indices)
                 mb_actions = batch_actions[mb_indices]
                 mb_log_probs = batch_log_probs[mb_indices]
                 mb_advantages = batch_advantages[mb_indices]
@@ -374,7 +426,15 @@ class PPOJobShopRL:
                 updates, opt_state = self.optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
 
-        return params, opt_state, metrics
+                all_metrics.append(metrics)
+
+        # Average metrics across all updates
+        avg_metrics = tree.tree_map(
+            lambda *args: jnp.mean(jnp.stack(args)),
+            *all_metrics
+        )
+
+        return params, opt_state, avg_metrics
 
     def evaluate(self, params, num_episodes=32):
         """Evaluate the current policy."""
