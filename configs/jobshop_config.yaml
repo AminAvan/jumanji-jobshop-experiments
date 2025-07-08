@@ -1,0 +1,14 @@
+environment:
+  name: "JobShop-v0"
+
+experiment:
+  num_episodes: 100
+  num_scenarios: 5
+
+random_policy:
+  seed: 42
+
+visualization:
+  render_episodes: true
+  save_plots: true
+  plot_dir: "../results/plots"
