@@ -476,12 +476,6 @@ class PPOJobShopRL:
             log_probs_array = jnp.array(log_probs)
             values_array = jnp.array(values)
 
-            # Debug shape info on first step
-            if step == 0:
-                print(f"Debug - Action shape: {actions_array.shape}")
-                print(f"Debug - Log probs shape: {log_probs_array.shape}")
-                print(f"Debug - Values shape: {values_array.shape}")
-
             all_actions.append(actions_array)
             all_log_probs.append(log_probs_array)
             all_values.append(values_array)
@@ -539,10 +533,6 @@ class PPOJobShopRL:
             'values': jnp.stack(all_values),
             'log_probs': jnp.stack(all_log_probs)
         }
-
-        # Debug final shapes
-        print(f"Debug - Final actions shape: {trajectories_data['actions'].shape}")
-        print(f"Debug - Final log_probs shape: {trajectories_data['log_probs'].shape}")
 
         # Compute advantages for each environment with proper bootstrapping
         advantages_list = []
@@ -654,13 +644,6 @@ class PPOJobShopRL:
                 self.config.value_loss_coef * value_loss +
                 self.config.entropy_coef * entropy_loss
         )
-
-        # Check for NaN/Inf
-        if jnp.any(jnp.isnan(total_loss)) or jnp.any(jnp.isinf(total_loss)):
-            print("WARNING: NaN or Inf detected in loss!")
-            print(f"  Policy loss: {policy_loss}")
-            print(f"  Value loss: {value_loss}")
-            print(f"  Entropy loss: {entropy_loss}")
 
         metrics = {
             'policy_loss': policy_loss,
