@@ -39,11 +39,11 @@ class PPOConfig:
     transformer_key_size: int = 16
     transformer_mlp_units: List[int] = None
 
-    # Training config
+    # Training config - FIXED VALUES
     num_epochs: int = 65
     num_learner_steps_per_epoch: int = 50
-    n_steps: int = 10
-    total_batch_size: int = 128
+    n_steps: int = 128  # Increased from 10 for better estimates
+    total_batch_size: int = 256  # Increased to match longer trajectories
     num_minibatches: int = 4
     update_epochs: int = 4
 
@@ -51,15 +51,16 @@ class PPOConfig:
     eval_episodes: int = 16
     eval_frequency: int = 10
 
-    # PPO hyperparameters
-    learning_rate: float = 1e-4
+    # PPO hyperparameters - FIXED VALUES
+    learning_rate: float = 3e-4  # Slightly higher for transformer
     discount_factor: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
-    value_loss_coef: float = 1.0
-    entropy_coef: float = 0.5
+    value_loss_coef: float = 0.5  # Reduced from 1.0
+    entropy_coef: float = 0.01  # Significantly reduced from 0.5
     max_grad_norm: float = 0.5
     normalize_advantage: bool = True
+    normalize_returns: bool = True  # Added for value function stability
 
     # Logging config
     log_frequency: int = 10  # Log every N steps
@@ -82,6 +83,7 @@ class PPOTrajectory(NamedTuple):
     returns: jnp.ndarray
     episode_lengths: jnp.ndarray  # Added for logging
     episode_returns: jnp.ndarray  # Added for logging
+    next_values: jnp.ndarray  # Added for proper GAE computation
 
 
 class MetricsLogger:
@@ -351,10 +353,11 @@ class PPOJobShopRL:
         value = jnp.squeeze(value, axis=0)
         entropy = jnp.squeeze(entropy, axis=0)
 
-        # For MultiCategorical, log_prob has shape (num_machines,)
-        # We need to sum across machines to get a single log prob for the joint action
-        log_prob = jnp.sum(log_prob)
-        entropy = jnp.sum(entropy)
+        # For MultiCategorical, we need to handle the log_prob properly
+        # The log_prob is the sum of log_probs for each machine's action
+        if len(log_prob.shape) > 0:  # MultiCategorical case
+            log_prob = jnp.sum(log_prob)
+            entropy = jnp.mean(entropy)  # Use mean entropy instead of sum
 
         return action, log_prob, value, entropy
 
@@ -376,14 +379,21 @@ class PPOJobShopRL:
         log_probs = action_dist.log_prob(actions_batch)
         entropy = action_dist.entropy()
 
-        # For MultiCategorical, sum log probs and entropy across machines
-        log_probs = jnp.sum(log_probs, axis=-1)  # Sum across machines
-        entropy = jnp.sum(entropy, axis=-1)  # Sum across machines
+        # For MultiCategorical, we need to sum log_probs across machines
+        # Check if we have multiple machines dimension
+        if len(log_probs.shape) > 1:  # (batch_size, num_machines)
+            log_probs = jnp.sum(log_probs, axis=-1)  # Sum to get (batch_size,)
+
+        if len(entropy.shape) > 1:  # (batch_size, num_machines)
+            entropy = jnp.mean(entropy, axis=-1)  # Mean to get (batch_size,)
+
+        # Squeeze values if needed
+        values = jnp.squeeze(values, axis=-1) if values.ndim > 1 and values.shape[-1] == 1 else values
 
         return log_probs, values, entropy
 
-    def compute_gae(self, rewards, values, dones):
-        """Compute Generalized Advantage Estimation."""
+    def compute_gae(self, rewards, values, dones, next_values):
+        """Compute Generalized Advantage Estimation with proper bootstrapping."""
         T = len(rewards)
         advantages = jnp.zeros(T)
         lastgaelam = 0
@@ -391,7 +401,7 @@ class PPOJobShopRL:
         for t in reversed(range(T)):
             if t == T - 1:
                 nextnonterminal = 1.0 - dones[-1]
-                nextvalues = 0
+                nextvalues = next_values  # Use actual next values
             else:
                 nextnonterminal = 1.0 - dones[t]
                 nextvalues = values[t + 1]
@@ -466,6 +476,12 @@ class PPOJobShopRL:
             log_probs_array = jnp.array(log_probs)
             values_array = jnp.array(values)
 
+            # Debug shape info on first step
+            if step == 0:
+                print(f"Debug - Action shape: {actions_array.shape}")
+                print(f"Debug - Log probs shape: {log_probs_array.shape}")
+                print(f"Debug - Values shape: {values_array.shape}")
+
             all_actions.append(actions_array)
             all_log_probs.append(log_probs_array)
             all_values.append(values_array)
@@ -479,7 +495,7 @@ class PPOJobShopRL:
                 states[i] = state
                 timesteps[i] = timestep
 
-                reward = float(timestep.reward)  # Ensure float
+                reward = float(timestep.reward)
                 done = timestep.last()
 
                 rewards.append(reward)
@@ -506,6 +522,14 @@ class PPOJobShopRL:
             all_rewards.append(rewards)
             all_dones.append(dones)
 
+        # Get next values for proper GAE computation
+        next_values = []
+        keys = jax.random.split(key, num_envs + 1)
+        for i in range(num_envs):
+            _, _, next_value, _ = self.act(params, timesteps[i].observation, keys[i + 1])
+            next_values.append(next_value)
+        next_values = jnp.array(next_values)
+
         # Convert lists to arrays
         trajectories_data = {
             'observations': all_observations,
@@ -516,7 +540,11 @@ class PPOJobShopRL:
             'log_probs': jnp.stack(all_log_probs)
         }
 
-        # Compute advantages for each environment
+        # Debug final shapes
+        print(f"Debug - Final actions shape: {trajectories_data['actions'].shape}")
+        print(f"Debug - Final log_probs shape: {trajectories_data['log_probs'].shape}")
+
+        # Compute advantages for each environment with proper bootstrapping
         advantages_list = []
         returns_list = []
 
@@ -524,8 +552,9 @@ class PPOJobShopRL:
             env_rewards = trajectories_data['rewards'][:, env_idx]
             env_values = trajectories_data['values'][:, env_idx]
             env_dones = trajectories_data['dones'][:, env_idx]
+            env_next_value = next_values[env_idx]
 
-            adv, ret = self.compute_gae(env_rewards, env_values, env_dones)
+            adv, ret = self.compute_gae(env_rewards, env_values, env_dones, env_next_value)
             advantages_list.append(adv)
             returns_list.append(ret)
 
@@ -541,13 +570,14 @@ class PPOJobShopRL:
         total_steps = self.config.n_steps * num_envs
         steps_per_second = total_steps / collect_time if collect_time > 0 else 0
 
-        # Log actor metrics if we have completed episodes or use empty lists
-        self.logger.log_actor_metrics(
-            steps=total_steps,
-            episode_returns=completed_returns if completed_returns else [0.0],
-            episode_lengths=completed_lengths if completed_lengths else [0],
-            steps_per_second=steps_per_second
-        )
+        # Log actor metrics if we have completed episodes
+        if completed_returns:
+            self.logger.log_actor_metrics(
+                steps=total_steps,
+                episode_returns=completed_returns,
+                episode_lengths=completed_lengths,
+                steps_per_second=steps_per_second
+            )
 
         return PPOTrajectory(
             observations=trajectories_data['observations'],
@@ -559,7 +589,8 @@ class PPOJobShopRL:
             advantages=advantages,
             returns=returns,
             episode_lengths=jnp.array(completed_lengths) if completed_lengths else jnp.array([0]),
-            episode_returns=jnp.array(completed_returns) if completed_returns else jnp.array([0.0])
+            episode_returns=jnp.array(completed_returns) if completed_returns else jnp.array([0.0]),
+            next_values=next_values
         )
 
     def create_minibatch(self, observations_list, batch_indices):
@@ -603,8 +634,16 @@ class PPOJobShopRL:
             clipped_ratio * advantages
         ).mean()
 
-        # Value loss
-        value_loss = 0.5 * ((values - returns) ** 2).mean()
+        # Value loss with optional normalization
+        if self.config.normalize_returns:
+            # Normalize returns for value function training
+            returns_mean = returns.mean()
+            returns_std = returns.std() + 1e-8
+            normalized_returns = (returns - returns_mean) / returns_std
+            normalized_values = (values - returns_mean) / returns_std
+            value_loss = 0.5 * ((normalized_values - normalized_returns) ** 2).mean()
+        else:
+            value_loss = 0.5 * ((values - returns) ** 2).mean()
 
         # Entropy bonus
         entropy_loss = -entropy.mean()
@@ -615,6 +654,13 @@ class PPOJobShopRL:
                 self.config.value_loss_coef * value_loss +
                 self.config.entropy_coef * entropy_loss
         )
+
+        # Check for NaN/Inf
+        if jnp.any(jnp.isnan(total_loss)) or jnp.any(jnp.isinf(total_loss)):
+            print("WARNING: NaN or Inf detected in loss!")
+            print(f"  Policy loss: {policy_loss}")
+            print(f"  Value loss: {value_loss}")
+            print(f"  Entropy loss: {entropy_loss}")
 
         metrics = {
             'policy_loss': policy_loss,
@@ -638,8 +684,12 @@ class PPOJobShopRL:
             for env in range(n_envs):
                 batch_observations.append(trajectories.observations[step][env])
 
-        # Flatten other arrays
-        batch_actions = trajectories.actions.reshape(batch_size, -1)
+        # Check action shape and flatten appropriately
+        if len(trajectories.actions.shape) == 3:  # (n_steps, n_envs, n_machines)
+            batch_actions = trajectories.actions.reshape(batch_size, -1)
+        else:  # Already (n_steps, n_envs)
+            batch_actions = trajectories.actions.reshape(batch_size)
+
         batch_log_probs = trajectories.log_probs.reshape(batch_size)
         batch_advantages = trajectories.advantages.reshape(batch_size)
         batch_returns = trajectories.returns.reshape(batch_size)
@@ -660,7 +710,13 @@ class PPOJobShopRL:
 
                 # Create minibatch with proper structure
                 mb_observations = self.create_minibatch(batch_observations, mb_indices)
-                mb_actions = batch_actions[mb_indices]
+
+                # Handle action shape properly
+                if len(batch_actions.shape) == 2:  # (batch_size, n_machines)
+                    mb_actions = batch_actions[mb_indices]
+                else:  # (batch_size,)
+                    mb_actions = batch_actions[mb_indices].reshape(-1, 1)
+
                 mb_log_probs = batch_log_probs[mb_indices]
                 mb_advantages = batch_advantages[mb_indices]
                 mb_returns = batch_returns[mb_indices]
@@ -716,7 +772,7 @@ class PPOJobShopRL:
             total_rewards.append(episode_reward)
             episode_lengths.append(steps)
 
-            # Calculate makespan from the final state
+            # Calculate makespan from the final state properly
             if hasattr(state, 'scheduled_times') and hasattr(state, 'ops_durations'):
                 completion_times = []
                 for job_idx in range(state.scheduled_times.shape[0]):
@@ -730,8 +786,12 @@ class PPOJobShopRL:
                 if completion_times:
                     makespans.append(max(completion_times))
                 else:
-                    # If no completion times found, use negative reward as proxy
-                    makespans.append(-episode_reward)
+                    # Default makespan if no valid operations found
+                    makespans.append(
+                        float(self.config.num_jobs * self.config.max_num_ops * self.config.max_op_duration))
+            else:
+                # Estimate makespan from episode length
+                makespans.append(float(steps))
 
         eval_time = time.time() - eval_start_time
 
@@ -940,12 +1000,12 @@ def main():
     # Create results directory
     os.makedirs('results', exist_ok=True)
 
-    # Create PPO configuration
+    # Create PPO configuration with fixed hyperparameters
     config = PPOConfig()
 
     print("=" * 60)
-    print("PPO WITH OFFICIAL JUMANJI NETWORKS")
-    print("Single-Agent JobShop RL with Detailed Logging")
+    print("PPO WITH OFFICIAL JUMANJI NETWORKS (FIXED)")
+    print("Single-Agent JobShop RL with Improved Implementation")
     print("=" * 60)
 
     # Create and train PPO agent
@@ -964,7 +1024,7 @@ def main():
 
     # Save comprehensive results
     results = {
-        'algorithm': 'PPO with Official Jumanji Networks',
+        'algorithm': 'PPO with Official Jumanji Networks (Fixed)',
         'network_architecture': {
             'type': 'Transformer-based',
             'num_layers_machines': config.num_layers_machines,
@@ -982,7 +1042,10 @@ def main():
             'num_epochs': config.num_epochs,
             'learning_rate': config.learning_rate,
             'clip_epsilon': config.clip_epsilon,
-            'discount_factor': config.discount_factor
+            'discount_factor': config.discount_factor,
+            'n_steps': config.n_steps,
+            'entropy_coef': config.entropy_coef,
+            'value_loss_coef': config.value_loss_coef
         },
         'initial_performance': init_results,
         'final_performance': final_results,
@@ -1013,10 +1076,10 @@ def main():
 
     results = convert_to_serializable(results)
 
-    with open('results/ppo_official_networks_results_with_timing.json', 'w') as f:
+    with open('results/ppo_official_networks_results_fixed.json', 'w') as f:
         json.dump(results, f, indent=2)
 
-    print("\nResults saved to 'results/ppo_official_networks_results_with_timing.json'")
+    print("\nResults saved to 'results/ppo_official_networks_results_fixed.json'")
     print(f"\nTraining Summary:")
     print(f"  Total Training Time: {timedelta(seconds=int(all_metrics['total_training_time']))}")
     print(f"  Total Steps: {all_metrics['total_steps']:,}")
@@ -1025,20 +1088,17 @@ def main():
     print(f"  Makespan Improvement: {makespan_improvement:.2f} ({results['improvements']['makespan_percentage']:.1f}%)")
 
     print("\n" + "=" * 60)
-    print("NETWORK ARCHITECTURE INSIGHTS")
+    print("KEY FIXES APPLIED:")
     print("=" * 60)
-    print("\nOfficial Jumanji Networks use:")
-    print("✓ Transformer blocks for machine embeddings")
-    print("✓ Self-attention between operations")
-    print("✓ Cross-attention between operations and machines")
-    print("✓ Positional encoding for operation sequences")
-    print("✓ Separate embeddings for jobs and machines")
-    print("✓ Multi-head attention mechanisms")
-    print("\nThis sophisticated architecture is designed to:")
-    print("- Capture complex dependencies between operations")
-    print("- Respect the sequential nature of job operations")
-    print("- Model machine-operation compatibility")
-    print("- Handle variable-length operation sequences")
+    print("✓ Reduced entropy coefficient from 0.5 to 0.01")
+    print("✓ Increased trajectory length from 10 to 128 steps")
+    print("✓ Fixed GAE computation with proper value bootstrapping")
+    print("✓ Improved action probability handling for MultiCategorical")
+    print("✓ Added value function normalization option")
+    print("✓ Fixed makespan calculation fallback")
+    print("✓ Added NaN/Inf detection in loss computation")
+    print("✓ Increased learning rate to 3e-4 for transformer")
+    print("✓ Reduced value loss coefficient to 0.5")
 
 
 if __name__ == "__main__":
